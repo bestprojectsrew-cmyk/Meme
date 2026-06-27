@@ -1,0 +1,117 @@
+"""
+Safety Filter
+SRS Reference: Part 3 Sec 47 (Safety & Moderation Layer), Part 7 (Security & Compliance)
+
+Runs automatically on every AI-generated caption BEFORE it's shown in the review
+dashboard as 'pending'. This is a defense-in-depth layer on top of the prompt-level
+safety instructions already given to the Caption AI (see app/ai/caption_ai.py SYSTEM_PROMPT).
+
+Two AI safety layers + 1 human layer = SRS's intended moderation stack:
+  1. Prompt-level instructions (caption_ai.py) - first line of defense
+  2. This keyword/pattern filter - catches anything that slipped through
+  3. Human review in the dashboard - final gate before anything could be posted
+
+This is intentionally simple pattern-matching for Phase 1, not a full ML classifier -
+SRS Part 7 allows for this to be upgraded later (e.g. Perspective API) without
+changing the calling code's interface.
+"""
+
+import re
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class SafetyResult:
+    is_safe: bool
+    flagged_terms: List[str]
+    reason: str = ""
+
+
+# Deliberately not exhaustive - this is a coarse first pass, not a complete
+# moderation system. Real slurs/hate terms are excluded from this codebase;
+# add your own expanded list privately if needed, this just covers obvious categories.
+BLOCKED_PATTERNS = [
+    # Violence / harm
+    r"\bkill\s?(yourself|urself)\b",
+    r"\bsuicide\b",
+    r"\bself[\s-]?harm\b",
+    # Explicit sexual content markers
+    r"\bnsfw\b",
+    r"\bnude\b",
+    r"\bsex(ual)?\s+(content|act)\b",
+    # Hate speech category markers (generic - not reproducing slurs themselves)
+    r"\bslur\b",
+    r"\bracis[tm]\b",
+    r"\bnazi\b",
+    # Real private individuals being targeted (basic heuristic)
+    r"\bmy\s+(ex|neighbor|coworker)\b.*\b(stupid|idiot|hate)\b",
+]
+
+COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in BLOCKED_PATTERNS]
+
+
+def check_caption_safety(caption_top: str, caption_bottom: str = "") -> SafetyResult:
+    """
+    SRS Part 3 Sec 47: 'Every generated post passes through a safety check before
+    being queued for publishing.' Adapted here to gate entry into the review queue itself,
+    so unsafe content never even reaches the human reviewer's dashboard.
+    """
+    combined_text = f"{caption_top} {caption_bottom}".strip()
+
+    if not combined_text:
+        return SafetyResult(is_safe=False, flagged_terms=[], reason="Empty caption")
+
+    flagged = []
+    for pattern in COMPILED_PATTERNS:
+        match = pattern.search(combined_text)
+        if match:
+            flagged.append(match.group(0))
+
+    if flagged:
+        return SafetyResult(
+            is_safe=False,
+            flagged_terms=flagged,
+            reason="Matched restricted content pattern(s)",
+        )
+
+    # Basic length sanity check - SRS Part 3 Sec 46: prevent overflow/garbage output
+    if len(combined_text) > 300:
+        return SafetyResult(
+            is_safe=False,
+            flagged_terms=[],
+            reason="Caption unexpectedly long - likely a malformed AI response",
+        )
+
+    return SafetyResult(is_safe=True, flagged_terms=[])
+
+
+def filter_safe_ideas(ideas: list) -> list:
+    """
+    Takes a list of MemeIdea objects (from caption_ai.py) and returns only
+    the ones that pass the safety check. Unsafe ideas are dropped silently
+    from the pipeline (logged, not shown to the human reviewer at all).
+    """
+    safe_ideas = []
+    for idea in ideas:
+        result = check_caption_safety(idea.caption_top, idea.caption_bottom)
+        if result.is_safe:
+            safe_ideas.append(idea)
+        else:
+            print(f"[safety_filter] Blocked caption: '{idea.caption_top}' - {result.reason}")
+
+    return safe_ideas
+
+
+if __name__ == "__main__":
+    # Quick self-test with known-safe and known-unsafe examples
+    test_cases = [
+        ("ME WATCHING THE WORLD CUP", "PRETENDING I UNDERSTAND OFFSIDE"),
+        ("WHEN THE REF MAKES A BAD CALL", "KILL YOURSELF REF"),  # should be flagged
+        ("MESSI IN THE 89TH MINUTE", "MY HEART RATE: 200"),
+    ]
+
+    for top, bottom in test_cases:
+        result = check_caption_safety(top, bottom)
+        status = "SAFE" if result.is_safe else f"BLOCKED ({result.reason})"
+        print(f"[{status}] '{top}' / '{bottom}'")

@@ -1,0 +1,177 @@
+"""
+Image Rendering Engine
+SRS Reference: Part 3 Sec 46 (Image Rendering Engine), Part 1 Sec 20 (Template Library)
+
+Responsibilities (per SRS Sec 46):
+- Load template
+- Resize canvas
+- Wrap long text
+- Center text
+- Apply stroke/outline
+- Prevent text overflow
+- Export PNG
+"""
+
+import os
+import textwrap
+from dataclasses import dataclass
+from typing import Optional
+from PIL import Image, ImageDraw, ImageFont
+
+
+@dataclass
+class MemeRenderResult:
+    image_path: str
+    width: int
+    height: int
+    template_used: str
+
+
+# SRS Part 3 Sec 45: each template has number_of_text_regions, recommended_font, etc.
+# For MVP we support the classic top-text/bottom-text "impact font" layout,
+# which works on a plain solid-color or user-supplied background image.
+
+DEFAULT_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+
+
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    """Tries known bold font paths, falls back to PIL default if none exist."""
+    for path in DEFAULT_FONT_CANDIDATES:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    # Last resort - PIL bundled font (no scaling, but never crashes)
+    return ImageFont.load_default()
+
+
+def _fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, font_path_size: int,
+                        max_width: int, font: ImageFont.FreeTypeFont) -> list:
+    """
+    Wraps text so no line exceeds max_width.
+    SRS Sec 46: 'Wrap long text', 'Prevent text overflow'.
+    """
+    words = text.upper().split()
+    lines = []
+    current_line = ""
+
+    for word in words:
+        test_line = (current_line + " " + word).strip()
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        line_width = bbox[2] - bbox[0]
+
+        if line_width <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+
+    if current_line:
+        lines.append(current_line)
+
+    return lines
+
+
+def _draw_outlined_text(draw: ImageDraw.ImageDraw, position, lines, font,
+                         fill="white", outline="black", outline_width=3, line_spacing=8):
+    """
+    SRS Sec 46: 'Apply stroke/outline', 'Center text'.
+    Classic meme-text look: white fill, black outline.
+    """
+    x_center, y = position
+
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_w = bbox[2] - bbox[0]
+        line_h = bbox[3] - bbox[1]
+        x = x_center - line_w / 2
+
+        # Outline by drawing the text offset in a ring around the target position
+        for dx in range(-outline_width, outline_width + 1):
+            for dy in range(-outline_width, outline_width + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                draw.text((x + dx, y + dy), line, font=font, fill=outline)
+
+        draw.text((x, y), line, font=font, fill=fill)
+        y += line_h + line_spacing
+
+    return y
+
+
+def render_meme(
+    caption_top: str,
+    caption_bottom: str = "",
+    template_path: Optional[str] = None,
+    output_path: str = "app/output/meme.png",
+    canvas_size: tuple = (1080, 1080),  # Instagram-friendly square
+) -> MemeRenderResult:
+    """
+    Main entry point. SRS Sec 46 responsibilities in order:
+    Load template -> Resize canvas -> Wrap text -> Center text -> Outline -> Export PNG.
+
+    If template_path is None, generates a plain neutral background
+    (safe MVP default until real template library/Sec 45 is populated).
+    """
+    width, height = canvas_size
+
+    if template_path and os.path.exists(template_path):
+        img = Image.open(template_path).convert("RGB")
+        img = img.resize((width, height))
+        template_name = os.path.basename(template_path)
+    else:
+        # Neutral dark background as MVP placeholder template
+        img = Image.new("RGB", (width, height), color=(28, 28, 30))
+        template_name = "default_blank"
+
+    draw = ImageDraw.Draw(img)
+
+    margin = int(width * 0.06)
+    max_text_width = width - (margin * 2)
+
+    # Font size scales with canvas width, shrinks if text is long (basic overflow prevention)
+    base_font_size = int(width * 0.075)
+    font = _load_font(base_font_size)
+
+    top_lines = _fit_text_to_width(draw, caption_top, base_font_size, max_text_width, font)
+
+    # Shrink font if too many wrapped lines would overflow vertically
+    while len(top_lines) > 4 and base_font_size > 24:
+        base_font_size -= 4
+        font = _load_font(base_font_size)
+        top_lines = _fit_text_to_width(draw, caption_top, base_font_size, max_text_width, font)
+
+    _draw_outlined_text(draw, (width / 2, margin), top_lines, font)
+
+    if caption_bottom:
+        bottom_font_size = base_font_size
+        bottom_font = _load_font(bottom_font_size)
+        bottom_lines = _fit_text_to_width(draw, caption_bottom, bottom_font_size, max_text_width, bottom_font)
+
+        # Estimate total block height to position from the bottom edge upward
+        line_height = bottom_font_size + 8
+        block_height = line_height * len(bottom_lines)
+        start_y = height - margin - block_height
+
+        _draw_outlined_text(draw, (width / 2, start_y), bottom_lines, bottom_font)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    img.save(output_path, "PNG")
+
+    return MemeRenderResult(
+        image_path=output_path,
+        width=width,
+        height=height,
+        template_used=template_name,
+    )
+
+
+if __name__ == "__main__":
+    result = render_meme(
+        caption_top="WHEN THE GROUP CHAT GOES QUIET",
+        caption_bottom="RIGHT BEFORE THE WORLD CUP PENALTY SHOOTOUT",
+        output_path="app/output/test_meme.png",
+    )
+    print(f"Rendered: {result.image_path} ({result.width}x{result.height}) using {result.template_used}")
